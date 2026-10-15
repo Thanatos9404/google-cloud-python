@@ -441,6 +441,7 @@ class MetricsTracer:
         if not self.enabled or not HAS_OPENTELEMETRY_INSTALLED:
             return
         self.current_op.current_attempt.status = status
+        self.current_op.status = status
 
         # Build Attributes
         attempt_attributes = self._create_attempt_otel_attributes()

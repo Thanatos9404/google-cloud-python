@@ -104,3 +104,94 @@ def test_builtin_metrics_with_default_otel(not_emulator, shared_database):
             return
 
     pytest.fail(f"Metric '{constants.METRIC_NAME_OPERATION_COUNT}' not found.")
+
+
+def test_operation_latency_streaming_lifecycle(not_emulator, shared_database):
+    """
+    Verifies that operation latency is not recorded prematurely before stream
+    consumption, completes immediately when the stream finishes (even while
+    the StreamedResultSet reference remains in scope), and excludes consumer sleep.
+    """
+    import time
+
+    reader = InMemoryMetricReader()
+    meter_provider = MeterProvider(metric_readers=[reader])
+
+    old_factory = SpannerMetricsTracerFactory._metrics_tracer_factory
+    SpannerMetricsTracerFactory._metrics_tracer_factory = None
+    try:
+        with (
+            mock.patch(
+                "google.cloud.spanner_v1.metrics.metrics_tracer_factory.get_meter_provider",
+                return_value=meter_provider,
+            ),
+            mock.patch(
+                "google.cloud.spanner_v1.client.MeterProvider",
+                return_value=meter_provider,
+            ),
+            mock.patch.dict(os.environ, {"SPANNER_DISABLE_BUILTIN_METRICS": "false"}),
+        ):
+            with shared_database.snapshot() as snapshot:
+                results = snapshot.execute_sql("SELECT 1")
+
+                # Before consumption, operational metrics for the stream should not be completed
+                metric_data_before = reader.get_metrics_data()
+                streaming_op_latencies_before = [
+                    p
+                    for rm in (
+                        metric_data_before.resource_metrics
+                        if metric_data_before
+                        else []
+                    )
+                    for sm in rm.scope_metrics
+                    for metric in sm.metrics
+                    if metric.name
+                    in (constants.METRIC_NAME_OPERATION_LATENCIES, "operation_latencies")
+                    for p in metric.data.data_points
+                    if p.attributes.get("method")
+                    in ("ExecuteStreamingSql", "Spanner.ExecuteStreamingSql")
+                ]
+                assert len(streaming_op_latencies_before) == 0
+
+                # Consume stream; consumer sleep should not inflate operation_latencies
+                for _ in results:
+                    time.sleep(0.1)
+
+                # Verify metrics are recorded while `results` is still in scope
+                metric_data_after = reader.get_metrics_data()
+    finally:
+        SpannerMetricsTracerFactory._metrics_tracer_factory = old_factory
+
+    assert metric_data_after is not None
+
+    streaming_op_latencies_after = [
+        p
+        for rm in metric_data_after.resource_metrics
+        for sm in rm.scope_metrics
+        for metric in sm.metrics
+        if metric.name
+        in (constants.METRIC_NAME_OPERATION_LATENCIES, "operation_latencies")
+        for p in metric.data.data_points
+        if p.attributes.get("method")
+        in ("ExecuteStreamingSql", "Spanner.ExecuteStreamingSql")
+    ]
+    streaming_attempt_latencies_after = [
+        p
+        for rm in metric_data_after.resource_metrics
+        for sm in rm.scope_metrics
+        for metric in sm.metrics
+        if metric.name
+        in (constants.METRIC_NAME_ATTEMPT_LATENCIES, "attempt_latencies")
+        for p in metric.data.data_points
+        if p.attributes.get("method")
+        in ("ExecuteStreamingSql", "Spanner.ExecuteStreamingSql")
+    ]
+    assert len(streaming_op_latencies_after) == 1
+    assert streaming_op_latencies_after[0].sum > 0
+    assert streaming_op_latencies_after[0].attributes.get("status") == "OK"
+    if streaming_attempt_latencies_after:
+        assert (
+            streaming_op_latencies_after[0].sum
+            >= streaming_attempt_latencies_after[0].sum
+        )
+
